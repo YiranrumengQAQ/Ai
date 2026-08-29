@@ -1,338 +1,447 @@
 #!/usr/bin/env python3
 """
-动态多路由可配置 API 网关与 Google Material Design 3 控制台
-支持动态输入输出转换、URL 重写、流式代理与限流
+M3 Dynamic Aggregation Gateway & Control Center
+Fully replaces New-API with zero external DB dependencies.
+Built-in Input Hard-Trimming, Output Token Clamping & Load Balancing.
 """
 import os
 import json
-import asyncio
-from typing import Dict, Any, List
-from aiohttp import web, ClientSession, ClientTimeout
+import random
+import aiohttp
+from aiohttp import web
 
-CONFIG_PATH = os.environ.get("GW_CONFIG_PATH", "/opt/stack-deploy/gateway/routes.json")
+CONFIG_PATH = os.environ.get("GW_CONFIG_PATH", "/opt/stack-deploy/gateway/gateway_config.json")
 DEFAULT_PORT = int(os.environ.get("GW_PORT", "8080"))
 
-DEFAULT_CONFIG = {
-    "gateway_settings": {
-        "title": "M3 Core Dynamic Gateway",
-        "log_level": "INFO",
-        "max_connections": 5000,
-        "timeout_seconds": 60
+DEFAULT_DATA = {
+    "security": {
+        "admin_key": "sk-admin-root",
+        "allowed_client_keys": ["sk-astrbot-client-key"]
     },
-    "routes": [
+    "global_limits": {
+        "force_max_input_chars": 40,
+        "force_max_output_tokens": 40,
+        "keep_last_n_messages": 1,
+        "override_temperature": 0.2,
+        "stream_response": True
+    },
+    "channels": [
         {
-            "id": "astrbot-route",
-            "name": "AstrBot Direct Stream",
-            "path_prefix": "/bot-proxy",
-            "target_url": "http://127.0.0.1:6185",
-            "strip_prefix": True,
-            "enable_cors": True,
-            "custom_headers": {"X-Gateway-By": "M3-Dynamic"},
-            "active": True
-        },
-        {
-            "id": "newapi-route",
-            "name": "New-API High Concurrency Gateway",
-            "path_prefix": "/v1",
-            "target_url": "http://127.0.0.1:3000/v1",
-            "strip_prefix": False,
-            "enable_cors": True,
-            "custom_headers": {"X-Proxy-Target": "NewAPI"},
-            "active": True
+            "id": "ch-default-1",
+            "name": "OpenAI / Gemini 聚合通道",
+            "active": True,
+            "base_url": "https://api.openai.com",
+            "api_key": "sk-your-actual-api-key-here",
+            "models": ["gpt-4o-mini", "gpt-3.5-turbo", "gemini-2.5-flash"],
+            "model_mapping": {
+                "openai/gemini-2.5-flash-lite": "gemini-2.5-flash"
+            }
         }
     ]
 }
 
-def load_config() -> Dict[str, Any]:
+def load_data():
     if not os.path.exists(CONFIG_PATH):
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_CONFIG, f, indent=2)
-        return DEFAULT_CONFIG
+            json.dump(DEFAULT_DATA, f, indent=2, ensure_ascii=False)
+        return DEFAULT_DATA
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return DEFAULT_CONFIG
+        return DEFAULT_DATA
 
-def save_config(data: Dict[str, Any]):
+def save_data(data):
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
-current_config = load_config()
+db = load_data()
 
-HTML_PAGE = """<!DOCTYPE html>
-<html lang="en">
+HTML_UI = """<!DOCTYPE html>
+<html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>M3 API Gateway Console</title>
+  <title>M3 Gateway Console</title>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0">
   <style>
     :root {
-      --md-sys-color-primary: #006494;
+      --md-sys-color-primary: #00639b;
       --md-sys-color-on-primary: #ffffff;
-      --md-sys-color-primary-container: #cbe6ff;
-      --md-sys-color-on-primary-container: #001e30;
-      --md-sys-color-surface: #f8f9fa;
-      --md-sys-color-on-surface: #191c1e;
-      --md-sys-color-surface-container: #edeef0;
-      --md-sys-color-outline: #72777f;
-      --md-sys-color-outline-variant: #c2c7cf;
-      --md-sys-shape-corner-medium: 16px;
-      --md-sys-shape-corner-small: 8px;
+      --md-sys-color-primary-container: #cce5ff;
+      --md-sys-color-on-primary-container: #001d32;
+      --md-sys-color-surface: #fdfcff;
+      --md-sys-color-surface-container: #f0f4f8;
+      --md-sys-color-surface-container-high: #e2e9ef;
+      --md-sys-color-on-surface: #1a1c1e;
+      --md-sys-color-outline: #72777e;
+      --md-sys-color-outline-variant: #c2c7ce;
+      --md-sys-color-error: #ba1a1a;
+      --md-sys-color-error-container: #ffdad6;
+      --md-sys-color-on-error: #ffffff;
     }
+    * { box-sizing: border-box; }
     body {
       margin: 0;
       padding: 0;
       font-family: 'Roboto', sans-serif;
-      background-color: var(--md-sys-color-surface);
+      background: var(--md-sys-color-surface);
       color: var(--md-sys-color-on-surface);
     }
-    .header {
+    .top-app-bar {
       background: var(--md-sys-color-primary-container);
       color: var(--md-sys-color-on-primary-container);
       padding: 16px 24px;
       display: flex;
       align-items: center;
       gap: 12px;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+      box-shadow: 0 1px 3px rgba(0,0,0,0.12);
     }
     .container {
-      max-width: 1000px;
+      max-width: 1100px;
       margin: 24px auto;
       padding: 0 16px;
     }
     .card {
       background: #ffffff;
-      border-radius: var(--md-sys-shape-corner-medium);
+      border: 1px solid var(--md-sys-color-outline-variant);
+      border-radius: 16px;
       padding: 24px;
       margin-bottom: 24px;
-      border: 1px solid var(--md-sys-color-outline-variant);
     }
     .card-title {
-      font-size: 1.25rem;
+      font-size: 1.2rem;
       font-weight: 500;
       display: flex;
       align-items: center;
       gap: 8px;
       margin-bottom: 16px;
+      color: var(--md-sys-color-primary);
     }
-    .route-item {
-      border: 1px solid var(--md-sys-color-outline-variant);
-      border-radius: var(--md-sys-shape-corner-small);
-      padding: 16px;
-      margin-bottom: 12px;
-      background: var(--md-sys-color-surface-container);
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
     }
-    .input-group {
-      margin-bottom: 12px;
+    .field {
+      margin-bottom: 16px;
     }
-    .input-group label {
+    .field label {
       display: block;
       font-size: 0.85rem;
       color: var(--md-sys-color-outline);
-      margin-bottom: 4px;
+      margin-bottom: 6px;
+      font-weight: 500;
     }
-    .input-group input, .input-group textarea {
+    .field input, .field textarea, .field select {
       width: 100%;
-      padding: 10px;
+      padding: 12px;
       border: 1px solid var(--md-sys-color-outline-variant);
-      border-radius: var(--md-sys-shape-corner-small);
-      box-sizing: border-box;
+      border-radius: 8px;
+      font-size: 0.95rem;
       font-family: monospace;
+      background: var(--md-sys-color-surface);
+    }
+    .channel-box {
+      background: var(--md-sys-color-surface-container);
+      border: 1px solid var(--md-sys-color-outline-variant);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 16px;
     }
     .btn {
-      background: var(--md-sys-color-primary);
-      color: var(--md-sys-color-on-primary);
-      border: none;
-      border-radius: var(--md-sys-shape-corner-small);
-      padding: 10px 20px;
-      cursor: pointer;
       display: inline-flex;
       align-items: center;
       gap: 8px;
+      padding: 10px 20px;
+      border-radius: 8px;
+      border: none;
+      background: var(--md-sys-color-primary);
+      color: var(--md-sys-color-on-primary);
       font-weight: 500;
+      cursor: pointer;
     }
     .btn-danger {
-      background: #ba1a1a;
+      background: var(--md-sys-color-error);
+      color: var(--md-sys-color-on-error);
     }
-    .badge {
-      display: inline-block;
-      padding: 2px 8px;
-      border-radius: 4px;
-      font-size: 0.75rem;
-      font-weight: 700;
-      background: #d1e7dd;
-      color: #0f5132;
+    .action-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 16px;
     }
   </style>
 </head>
 <body>
-  <div class="header">
-    <span class="material-symbols-outlined">dns</span>
-    <span style="font-size: 1.2rem; font-weight: 700;">M3 Dynamic Proxy Core Control</span>
+  <div class="top-app-bar">
+    <span class="material-symbols-outlined">tune</span>
+    <span style="font-size: 1.25rem; font-weight: 700;">M3 全功能聚合模型网关管理控制台</span>
   </div>
 
   <div class="container">
+    <!-- 全局输入输出流控参数 -->
     <div class="card">
       <div class="card-title">
-        <span class="material-symbols-outlined">hub</span> Active Inbound/Outbound Rules
+        <span class="material-symbols-outlined">data_thresholding</span> 全局 Token 与硬切片物理拦截
       </div>
-      <div id="routeList"></div>
-      <button class="btn" onclick="addRoute()">
-        <span class="material-symbols-outlined">add</span> Append New Dynamic Route
-      </button>
-      <button class="btn" style="float: right;" onclick="saveConfigToServer()">
-        <span class="material-symbols-outlined">save</span> Apply & Sync Pipeline
-      </button>
+      <div class="grid">
+        <div class="field">
+          <label>单次输入强制最大字符数 (0 为不限)</label>
+          <input type="number" id="force_max_input_chars">
+        </div>
+        <div class="field">
+          <label>单次输出物理锁定 Max Tokens</label>
+          <input type="number" id="force_max_output_tokens">
+        </div>
+        <div class="field">
+          <label>历史上下文强制保留轮数 (设为 1 杜绝历史叠加)</label>
+          <input type="number" id="keep_last_n_messages">
+        </div>
+        <div class="field">
+          <label>强制 Temperature 覆盖</label>
+          <input type="number" step="0.1" id="override_temperature">
+        </div>
+      </div>
+    </div>
+
+    <!-- 安全认证 -->
+    <div class="card">
+      <div class="card-title">
+        <span class="material-symbols-outlined">shield</span> 安全与鉴权密钥配置
+      </div>
+      <div class="grid">
+        <div class="field">
+          <label>控制台管理密钥 (sk-admin-xxx)</label>
+          <input type="text" id="admin_key">
+        </div>
+        <div class="field">
+          <label>允许客户端调用的 API Keys (每行一个)</label>
+          <textarea rows="3" id="allowed_client_keys"></textarea>
+        </div>
+      </div>
+    </div>
+
+    <!-- 上游模型聚合渠道管理 -->
+    <div class="card">
+      <div class="card-title">
+        <span class="material-symbols-outlined">account_tree</span> 上游模型聚合调度渠道 (负载均衡)
+      </div>
+      <div id="channelContainer"></div>
+      <div class="action-bar">
+        <button class="btn" onclick="addChannel()">
+          <span class="material-symbols-outlined">add</span> 添加新上游渠道
+        </button>
+        <button class="btn" onclick="saveAll()">
+          <span class="material-symbols-outlined">save</span> 立即热同步生效
+        </button>
+      </div>
     </div>
   </div>
 
   <script>
-    let state = { routes: [] };
+    let configState = {};
 
-    async function fetchConfig() {
+    async function loadConfig() {
       const res = await fetch('/_admin/api/config');
-      const data = await res.json();
-      state = data;
-      render();
+      configState = await res.json();
+
+      document.getElementById('force_max_input_chars').value = configState.global_limits.force_max_input_chars;
+      document.getElementById('force_max_output_tokens').value = configState.global_limits.force_max_output_tokens;
+      document.getElementById('keep_last_n_messages').value = configState.global_limits.keep_last_n_messages;
+      document.getElementById('override_temperature').value = configState.global_limits.override_temperature;
+
+      document.getElementById('admin_key').value = configState.security.admin_key;
+      document.getElementById('allowed_client_keys').value = configState.security.allowed_client_keys.join('\\n');
+
+      renderChannels();
     }
 
-    function render() {
-      const container = document.getElementById('routeList');
-      container.innerHTML = '';
-      state.routes.forEach((route, idx) => {
-        container.innerHTML += `
-          <div class="route-item">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-              <strong>${route.name}</strong>
-              <button class="btn btn-danger" style="padding:4px 8px;" onclick="removeRoute(${idx})">
-                <span class="material-symbols-outlined" style="font-size:16px;">delete</span>
+    function renderChannels() {
+      const box = document.getElementById('channelContainer');
+      box.innerHTML = '';
+      configState.channels.forEach((ch, idx) => {
+        box.innerHTML += `
+          <div class="channel-box">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px;">
+              <strong>${ch.name || '聚合通道'}</strong>
+              <button class="btn btn-danger" style="padding: 4px 8px;" onclick="removeChannel(${idx})">
+                <span class="material-symbols-outlined" style="font-size:18px;">delete</span>
               </button>
             </div>
-            <div class="input-group">
-              <label>Match Prefix</label>
-              <input value="${route.path_prefix}" onchange="state.routes[${idx}].path_prefix = this.value">
-            </div>
-            <div class="input-group">
-              <label>Target Upstream URL</label>
-              <input value="${route.target_url}" onchange="state.routes[${idx}].target_url = this.value">
+            <div class="grid">
+              <div class="field">
+                <label>通道名称</label>
+                <input value="${ch.name}" onchange="configState.channels[${idx}].name = this.value">
+              </div>
+              <div class="field">
+                <label>上游 Base URL</label>
+                <input value="${ch.base_url}" onchange="configState.channels[${idx}].base_url = this.value">
+              </div>
+              <div class="field">
+                <label>上游 API Key (Token)</label>
+                <input type="password" value="${ch.api_key}" onchange="configState.channels[${idx}].api_key = this.value">
+              </div>
+              <div class="field">
+                <label>支持的模型 (英文逗号分隔)</label>
+                <input value="${ch.models.join(',')}" onchange="configState.channels[${idx}].models = this.value.split(',').map(s => s.trim())">
+              </div>
             </div>
           </div>
         `;
       });
     }
 
-    function addRoute() {
-      state.routes.push({
-        id: "route-" + Math.random().toString(36).substring(7),
-        name: "Dynamic Proxy Node",
-        path_prefix: "/api/custom",
-        target_url: "http://127.0.0.1:8000",
-        strip_prefix: false,
-        enable_cors: true,
-        custom_headers: {},
-        active: true
+    function addChannel() {
+      configState.channels.push({
+        id: "ch-" + Math.random().toString(36).substring(7),
+        name: "新建上游渠道",
+        active: true,
+        base_url: "https://api.openai.com",
+        api_key: "sk-xxx",
+        models: ["gpt-4o-mini", "gemini-2.5-flash"],
+        model_mapping: {}
       });
-      render();
+      renderChannels();
     }
 
-    function removeRoute(idx) {
-      state.routes.splice(idx, 1);
-      render();
+    function removeChannel(idx) {
+      configState.channels.splice(idx, 1);
+      renderChannels();
     }
 
-    async function saveConfigToServer() {
+    async function saveAll() {
+      configState.global_limits.force_max_input_chars = parseInt(document.getElementById('force_max_input_chars').value) || 0;
+      configState.global_limits.force_max_output_tokens = parseInt(document.getElementById('force_max_output_tokens').value) || 40;
+      configState.global_limits.keep_last_n_messages = parseInt(document.getElementById('keep_last_n_messages').value) || 1;
+      configState.global_limits.override_temperature = parseFloat(document.getElementById('override_temperature').value) || 0.2;
+
+      configState.security.admin_key = document.getElementById('admin_key').value;
+      configState.security.allowed_client_keys = document.getElementById('allowed_client_keys').value.split('\\n').filter(s => s.trim().length > 0);
+
       await fetch('/_admin/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(state)
+        body: JSON.stringify(configState)
       });
-      alert('Config applied without service downtime.');
+      alert('网关配置已更新并实时生效！');
     }
 
-    fetchConfig();
+    loadConfig();
   </script>
 </body>
 </html>
 """
 
 async def admin_page(request):
-    return web.Response(text=HTML_PAGE, content_type='text/html')
+    return web.Response(text=HTML_UI, content_type='text/html')
 
 async def get_config_api(request):
-    return web.json_response(current_config)
+    return web.json_response(db)
 
 async def post_config_api(request):
-    global current_config
-    data = await request.json()
-    current_config = data
-    save_config(current_config)
+    global db
+    db = await request.json()
+    save_data(db)
     return web.json_response({"status": "ok"})
 
-async def proxy_handler(request):
-    req_path = request.path
-    matched_route = None
-    for route in current_config.get("routes", []):
-        if route.get("active", True) and req_path.startswith(route["path_prefix"]):
-            matched_route = route
-            break
+async def models_handler(request):
+    model_list = []
+    for ch in db.get("channels", []):
+        if ch.get("active", True):
+            for m in ch.get("models", []):
+                model_list.append({"id": m, "object": "model", "owned_by": "m3-gateway"})
+    return web.json_response({"object": "list", "data": model_list})
 
-    if not matched_route:
-        return web.Response(text="No dynamic upstream rule matched this endpoint.", status=404)
+async def chat_handler(request):
+    # 1. 客户端 Token 认证
+    auth_header = request.headers.get("Authorization", "")
+    client_token = auth_header.replace("Bearer ", "").strip()
+    allowed_keys = db.get("security", {}).get("allowed_client_keys", [])
+    admin_key = db.get("security", {}).get("admin_key", "")
+    
+    if allowed_keys and (client_token not in allowed_keys and client_token != admin_key):
+        return web.json_response({"error": {"message": "Invalid Client API Key", "type": "auth_error"}}, status=401)
 
-    target_base = matched_route["target_url"].rstrip('/')
-    if matched_route.get("strip_prefix", False):
-        sub_path = req_path[len(matched_route["path_prefix"]):]
-        target_url = f"{target_base}{sub_path}"
-    else:
-        target_url = f"{target_base}{req_path}"
-
-    if request.query_string:
-        target_url = f"{target_url}?{request.query_string}"
-
-    headers = dict(request.headers)
-    headers.pop("Host", None)
-    for k, v in matched_route.get("custom_headers", {}).items():
-        headers[k] = v
-
-    timeout = ClientTimeout(total=current_config.get("gateway_settings", {}).get("timeout_seconds", 60))
     try:
-        async with ClientSession(timeout=timeout) as session:
-            body = await request.read()
-            async with session.request(
-                method=request.method,
-                url=target_url,
-                headers=headers,
-                data=body,
-                allow_redirects=False
-            ) as resp:
-                response = web.StreamResponse(
-                    status=resp.status,
-                    headers=resp.headers
-                )
-                if matched_route.get("enable_cors", True):
-                    response.headers["Access-Control-Allow-Origin"] = "*"
-                    response.headers["Access-Control-Allow-Headers"] = "*"
-                    response.headers["Access-Control-Allow-Methods"] = "*"
+        req_data = await request.json()
+    except Exception:
+        return web.json_response({"error": {"message": "Invalid JSON Body"}}, status=400)
 
+    # 2. 获取目标模型并匹配上游渠道
+    req_model = req_data.get("model", "")
+    matched_channels = []
+    for ch in db.get("channels", []):
+        if ch.get("active", True):
+            if req_model in ch.get("models", []) or req_model in ch.get("model_mapping", {}):
+                matched_channels.append(ch)
+
+    if not matched_channels:
+        matched_channels = [ch for ch in db.get("channels", []) if ch.get("active", True)]
+    
+    if not matched_channels:
+        return web.json_response({"error": {"message": f"No available upstream channel for model {req_model}"}}, status=503)
+
+    target_ch = random.choice(matched_channels)
+    final_model = target_ch.get("model_mapping", {}).get(req_model, req_model)
+    req_data["model"] = final_model
+
+    # 3. 核心物理拦截：输入截断 + 单轮历史裁剪 + 输出 Tokens 锁死
+    limits = db.get("global_limits", {})
+    max_in = limits.get("force_max_input_chars", 40)
+    max_out = limits.get("force_max_output_tokens", 40)
+    keep_n = limits.get("keep_last_n_messages", 1)
+
+    if "messages" in req_data and isinstance(req_data["messages"], list):
+        # 强制只留最后 N 轮
+        if len(req_data["messages"]) > keep_n:
+            req_data["messages"] = req_data["messages"][-keep_n:]
+
+        # 强制将最新用户输入做字符级切片
+        last_msg = req_data["messages"][-1]
+        content = last_msg.get("content", "")
+        if isinstance(content, str) and max_in > 0 and len(content) > max_in:
+            last_msg["content"] = content[:max_in]
+
+    # 输出 Token 强写
+    req_data["max_tokens"] = max_out
+    if "temperature" in limits:
+        req_data["temperature"] = limits.get("override_temperature", 0.2)
+
+    # 4. 向上游转发流式/非流式响应
+    upstream_url = f"{target_ch['base_url'].rstrip('/')}/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {target_ch['api_key']}",
+        "Content-Type": "application/json"
+    }
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(upstream_url, headers=headers, json=req_data) as resp:
+                response = web.StreamResponse(status=resp.status, headers=resp.headers)
+                response.headers["Access-Control-Allow-Origin"] = "*"
                 await response.prepare(request)
                 async for chunk in resp.content.iter_any():
                     await response.write(chunk)
                 await response.write_eof()
                 return response
-    except Exception as e:
-        return web.Response(text=f"Gateway pipeline forward error: {str(e)}", status=502)
+        except Exception as e:
+            return web.json_response({"error": {"message": f"Upstream proxy failed: {str(e)}"}}, status=502)
 
-def make_app():
+def create_app():
     app = web.Application()
+    # 根路由与管理页面
+    app.router.add_get('/', admin_page)
     app.router.add_get('/_admin', admin_page)
     app.router.add_get('/_admin/api/config', get_config_api)
     app.router.add_post('/_admin/api/config', post_config_api)
-    app.router.add_route('*', '/{tail:.*}', proxy_handler)
+
+    # OpenAI 标准协议接口
+    app.router.add_get('/v1/models', models_handler)
+    app.router.add_post('/v1/chat/completions', chat_handler)
     return app
 
 if __name__ == '__main__':
-    web.run_app(make_app(), port=DEFAULT_PORT, host="0.0.0.0")
+    web.run_app(create_app(), host='0.0.0.0', port=DEFAULT_PORT)
