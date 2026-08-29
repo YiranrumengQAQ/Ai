@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 M3 Ultimate Shield Gateway & Model Aggregation Hub
+- Robust Multi-Version Config Migration & Persistence
 - Deep Prompt Flattening (Stripping Tools, System, Schema, and Multi-turn Bloat)
 - Arbitrary Hard Clamping for Input Characters and Output Tokens
 - Zero-Downtime Hot Reload & Latency Ping Testing
@@ -21,21 +22,21 @@ DEFAULT_DATA = {
         "allowed_client_keys": ["sk-astrbot-client-key"]
     },
     "shield_limits": {
-        "enable_super_shield": True,       # 终极防御总开关
-        "custom_input_clamp_chars": 40,   # 自定义输入锁定字符数 (默认 40)
-        "custom_output_max_tokens": 40,   # 自定义输出锁定 Token 数 (默认 40)
-        "strip_system_prompts": True,     # 彻底剥离系统人设
-        "strip_tool_definitions": True,   # 彻底剥离 Tools/Functions
-        "strip_history_context": True,    # 彻底剥离历史上下文
+        "enable_super_shield": True,
+        "custom_input_clamp_chars": 40,
+        "custom_output_max_tokens": 40,
+        "strip_system_prompts": True,
+        "strip_tool_definitions": True,
+        "strip_history_context": True,
         "override_temperature": 0.2
     },
     "channels": [
         {
             "id": "ch-default-1",
-            "name": "聚合上游渠道",
+            "name": "OpenAI Labs Gemini",
             "active": True,
             "base_url": "https://www.openai-labs.com",
-            "api_key": "sk-your-actual-key",
+            "api_key": "",
             "models": ["gemini-2.5-flash-lite", "gpt-4o-mini"],
             "model_mapping": {}
         }
@@ -45,13 +46,32 @@ DEFAULT_DATA = {
 def load_data():
     if not os.path.exists(CONFIG_PATH):
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_DATA, f, indent=2, ensure_ascii=False)
+        save_data(DEFAULT_DATA)
         return DEFAULT_DATA
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+            raw = json.load(f)
+            # 兼容并自动迁移旧版本字段
+            merged = DEFAULT_DATA.copy()
+            merged["security"] = {**DEFAULT_DATA["security"], **raw.get("security", {})}
+            
+            old_limits = raw.get("global_limits", {})
+            new_limits = raw.get("shield_limits", {})
+            merged["shield_limits"] = {
+                **DEFAULT_DATA["shield_limits"],
+                **old_limits,
+                **new_limits
+            }
+            if "force_max_output_tokens" in merged["shield_limits"] and "custom_output_max_tokens" not in new_limits:
+                merged["shield_limits"]["custom_output_max_tokens"] = merged["shield_limits"].pop("force_max_output_tokens")
+            if "max_total_input_chars" in merged["shield_limits"] and "custom_input_clamp_chars" not in new_limits:
+                merged["shield_limits"]["custom_input_clamp_chars"] = merged["shield_limits"].pop("max_total_input_chars")
+
+            channels = raw.get("channels", [])
+            merged["channels"] = channels if channels else DEFAULT_DATA["channels"]
+            return merged
+    except Exception as e:
+        print(f"[WARN] 加载配置失败，恢复默认: {e}")
         return DEFAULT_DATA
 
 def save_data(data):
@@ -209,23 +229,51 @@ HTML_UI = """<!DOCTYPE html>
   </div>
 
   <script>
-    let configState = {};
+    let configState = {
+      security: { admin_key: "sk-admin-root", allowed_client_keys: ["sk-astrbot-client-key"] },
+      shield_limits: { enable_super_shield: true, custom_input_clamp_chars: 40, custom_output_max_tokens: 40, override_temperature: 0.2 },
+      channels: []
+    };
+
     async function loadConfig() {
-      const res = await fetch('/_admin/api/config');
-      configState = await res.json();
-      document.getElementById('enable_super_shield').checked = configState.shield_limits.enable_super_shield;
-      document.getElementById('custom_input_clamp_chars').value = configState.shield_limits.custom_input_clamp_chars || 40;
-      document.getElementById('custom_output_max_tokens').value = configState.shield_limits.custom_output_max_tokens || 40;
-      document.getElementById('override_temperature').value = configState.shield_limits.override_temperature || 0.2;
-      document.getElementById('admin_key').value = configState.security.admin_key;
-      document.getElementById('allowed_client_keys').value = configState.security.allowed_client_keys.join('\\n');
-      renderChannels();
+      try {
+        const res = await fetch('/_admin/api/config');
+        const data = await res.json();
+        configState = data;
+
+        const s = configState.shield_limits || configState.global_limits || {};
+        const sec = configState.security || {};
+
+        document.getElementById('enable_super_shield').checked = s.enable_super_shield ?? true;
+        document.getElementById('custom_input_clamp_chars').value = s.custom_input_clamp_chars ?? s.max_total_input_chars ?? 40;
+        document.getElementById('custom_output_max_tokens').value = s.custom_output_max_tokens ?? s.force_max_output_tokens ?? 40;
+        document.getElementById('override_temperature').value = s.override_temperature ?? 0.2;
+
+        document.getElementById('admin_key').value = sec.admin_key || 'sk-admin-root';
+        document.getElementById('allowed_client_keys').value = (sec.allowed_client_keys || ['sk-astrbot-client-key']).join('\\n');
+
+        if (!configState.channels || configState.channels.length === 0) {
+          configState.channels = [{
+            id: "ch-default-1",
+            name: "OpenAI Labs Gemini",
+            active: true,
+            base_url: "https://www.openai-labs.com",
+            api_key: "",
+            models: ["gemini-2.5-flash-lite"],
+            model_mapping: {}
+          }];
+        }
+
+        renderChannels();
+      } catch (err) {
+        console.error("加载配置失败:", err);
+      }
     }
 
     function renderChannels() {
       const box = document.getElementById('channelContainer');
       box.innerHTML = '';
-      configState.channels.forEach((ch, idx) => {
+      (configState.channels || []).forEach((ch, idx) => {
         box.innerHTML += `
           <div class="channel-box">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px;">
@@ -242,19 +290,19 @@ HTML_UI = """<!DOCTYPE html>
             <div class="grid">
               <div class="field">
                 <label>通道名称</label>
-                <input value="${ch.name}" onchange="configState.channels[${idx}].name = this.value">
+                <input value="${ch.name || ''}" oninput="configState.channels[${idx}].name = this.value">
               </div>
               <div class="field">
                 <label>上游 Base URL (不要带末尾斜杠)</label>
-                <input value="${ch.base_url}" onchange="configState.channels[${idx}].base_url = this.value">
+                <input value="${ch.base_url || ''}" oninput="configState.channels[${idx}].base_url = this.value">
               </div>
               <div class="field">
                 <label>上游 API Key</label>
-                <input type="password" value="${ch.api_key}" onchange="configState.channels[${idx}].api_key = this.value">
+                <input type="password" value="${ch.api_key || ''}" oninput="configState.channels[${idx}].api_key = this.value">
               </div>
               <div class="field">
                 <label>支持模型 (逗号分隔)</label>
-                <input value="${ch.models.join(',')}" onchange="configState.channels[${idx}].models = this.value.split(',').map(s => s.trim())">
+                <input value="${(ch.models || []).join(',')}" oninput="configState.channels[${idx}].models = this.value.split(',').map(s => s.trim())">
               </div>
             </div>
             <div id="test-result-${idx}" style="font-size: 0.85rem; margin-top: 8px; font-family: monospace;"></div>
@@ -264,6 +312,7 @@ HTML_UI = """<!DOCTYPE html>
     }
 
     function addChannel() {
+      if (!configState.channels) configState.channels = [];
       configState.channels.push({
         id: "ch-" + Math.random().toString(36).substring(7),
         name: "新建渠道",
@@ -291,7 +340,7 @@ HTML_UI = """<!DOCTYPE html>
           body: JSON.stringify({
             base_url: configState.channels[idx].base_url,
             api_key: configState.channels[idx].api_key,
-            model: configState.channels[idx].models[0] || "gemini-2.5-flash-lite"
+            model: (configState.channels[idx].models && configState.channels[idx].models[0]) || "gemini-2.5-flash-lite"
           })
         });
         const data = await res.json();
@@ -306,19 +355,24 @@ HTML_UI = """<!DOCTYPE html>
     }
 
     async function saveAll() {
-      configState.shield_limits.enable_super_shield = document.getElementById('enable_super_shield').checked;
-      configState.shield_limits.custom_input_clamp_chars = parseInt(document.getElementById('custom_input_clamp_chars').value) || 40;
-      configState.shield_limits.custom_output_max_tokens = parseInt(document.getElementById('custom_output_max_tokens').value) || 40;
-      configState.shield_limits.override_temperature = parseFloat(document.getElementById('override_temperature').value) || 0.2;
-      configState.security.admin_key = document.getElementById('admin_key').value;
-      configState.security.allowed_client_keys = document.getElementById('allowed_client_keys').value.split('\\n').filter(s => s.trim().length > 0);
+      configState.shield_limits = {
+        enable_super_shield: document.getElementById('enable_super_shield').checked,
+        custom_input_clamp_chars: parseInt(document.getElementById('custom_input_clamp_chars').value) || 40,
+        custom_output_max_tokens: parseInt(document.getElementById('custom_output_max_tokens').value) || 40,
+        override_temperature: parseFloat(document.getElementById('override_temperature').value) || 0.2
+      };
+
+      configState.security = {
+        admin_key: document.getElementById('admin_key').value,
+        allowed_client_keys: document.getElementById('allowed_client_keys').value.split('\\n').map(s => s.trim()).filter(s => s.length > 0)
+      };
 
       await fetch('/_admin/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(configState)
       });
-      alert('超级防御策略已成功热同步！');
+      alert('超级防御策略与渠道配置已成功热保存！');
     }
 
     loadConfig();
@@ -334,7 +388,7 @@ async def post_config_api(request):
     global db
     db = await request.json()
     save_data(db)
-    print(">>> [SHIELD-CONFIG] 防御规则与渠道配置已热更新。")
+    print(">>> [SHIELD-CONFIG] 页面保存成功，配置与渠道已成功持久化至本地硬盘。")
     return web.json_response({"status": "ok"})
 
 async def test_channel_api(request):
@@ -391,17 +445,15 @@ async def chat_handler(request):
     target_ch = random.choice(matched_channels)
     req_data["model"] = target_ch.get("model_mapping", {}).get(req_model, req_model)
 
-    shield = db.get("shield_limits", {})
-    enable_shield = shield.get("enable_super_shield", True)
-    input_clamp = shield.get("custom_input_clamp_chars", 40)
-    output_clamp = shield.get("custom_output_max_tokens", 40)
-
-    # 深度清理 AstrBot 冗余字段（彻底剔除 tools / functions 等巨大结构）
     req_data.pop("tools", None)
     req_data.pop("functions", None)
     req_data.pop("tool_choice", None)
 
-    print("\n==================== [M3 SUPER SHIELD INTERCEPT] ====================")
+    shield = db.get("shield_limits", db.get("global_limits", {}))
+    enable_shield = shield.get("enable_super_shield", True)
+    input_clamp = shield.get("custom_input_clamp_chars", shield.get("max_total_input_chars", 40))
+    output_clamp = shield.get("custom_output_max_tokens", shield.get("force_max_output_tokens", 40))
+
     if enable_shield:
         user_text = ""
         if "messages" in req_data and isinstance(req_data["messages"], list):
@@ -410,17 +462,11 @@ async def chat_handler(request):
                     user_text = sanitize_text(msg.get("content", ""))
                     break
         
-        # 强制锁死输入字符数
         clamped_text = user_text[:input_clamp]
         req_data["messages"] = [{"role": "user", "content": clamped_text}]
-        print(f"[!] 超级防御生效: 彻底剥离全部人设与上下文，强行精炼为 1 条用户消息并切断至 {len(clamped_text)} 字符:")
-        print(f"    真实送模内容: \"{clamped_text}\"")
 
-    # 强制锁死输出 Token
     req_data["max_tokens"] = output_clamp
     req_data["temperature"] = shield.get("override_temperature", 0.2)
-    print(f"[*] 输出 Tokens 物理锁定为: {output_clamp}")
-    print("======================================================================")
 
     upstream_url = f"{target_ch['base_url'].rstrip('/')}/v1/chat/completions"
     headers = {
