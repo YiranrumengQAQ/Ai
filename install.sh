@@ -8,6 +8,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${BASE_DIR}/config.env"
+RAW_BASE_URL="https://raw.githubusercontent.com/YiranrumengQAQ/Ai/main"
 
 # 1. 颜色与日志格式
 LOG_INFO="\033[34m[INFO]\033[0m"
@@ -20,25 +21,53 @@ ok()  { echo -e "${LOG_SUCCESS} $1"; }
 warn(){ echo -e "${LOG_WARN} $1"; }
 err() { echo -e "${LOG_ERROR} $1"; }
 
-# 2. 初始校验
+# 2. 初始权限校验
 if [ "$EUID" -ne 0 ]; then
     err "权限拒绝：必须使用 root 用户执行！"
     exit 1
 fi
 
+# 3. 自动同步远程依赖 (支持 curl 远程单行执行)
 if [ ! -f "$CONFIG_FILE" ]; then
-    warn "未找到配置文件，生成默认 config.env..."
-    # 自动释放配置文件 (如果单脚本直接运行)
-    # 此处读取内置的默认值
+    warn "未在本地检测到 config.env，尝试从 GitHub 自动同步配置..."
+    curl -fsSL "${RAW_BASE_URL}/config.env" -o "${BASE_DIR}/config.env" || true
 fi
-source "$CONFIG_FILE"
 
-# 3. 基础依赖管理与包管理器自适应
+if [ ! -f "${BASE_DIR}/gateway_app.py" ]; then
+    warn "未在本地检测到 gateway_app.py，尝试从 GitHub 自动同步网关代码..."
+    curl -fsSL "${RAW_BASE_URL}/gateway_app.py" -o "${BASE_DIR}/gateway_app.py" || true
+fi
+
+# 如果仍然不存在则提供安全缺省值
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+else
+    warn "未能获取远程配置文件，将加载内置默认参数运行..."
+    INSTALL_DOCKER="true"
+    ENABLE_FIREWALL="true"
+    INSTALL_ASTRBOT="true"
+    INSTALL_NEWAPI="true"
+    INSTALL_GATEWAY="true"
+    ENABLE_SSL="true"
+    AUTO_NIP_DOMAIN="true"
+    PORT_ASTRBOT_INTERNAL="6185"
+    PORT_NEWAPI_INTERNAL="3000"
+    PORT_GATEWAY_WEB="8080"
+    DIR_DATA_BASE="/opt/stack-deploy"
+    DIR_ASTRBOT="${DIR_DATA_BASE}/astrbot"
+    DIR_NEWAPI="${DIR_DATA_BASE}/new-api"
+    DIR_GATEWAY="${DIR_DATA_BASE}/gateway"
+    DIR_CERTS="/etc/ssl/stack-certs"
+    IMAGE_ASTRBOT="soulter/astrbot:latest"
+    IMAGE_NEWAPI="calciumion/new-api:latest"
+fi
+
+# 4. 基础依赖管理与包管理器自适应 (含 PEP 668 修复)
 install_dependencies() {
     log "检测并安装基础设施依赖与运行库..."
     if command -v apt-get &>/dev/null; then
         apt-get update -y -q
-        apt-get install -y -q curl wget sudo ufw iptables socat cron sqlite3 psmisc nginx procps net-tools iproute2 python3 python3-pip
+        apt-get install -y -q curl wget sudo ufw iptables socat cron sqlite3 psmisc nginx procps net-tools iproute2 python3 python3-pip python3-aiohttp
         systemctl enable --now cron 2>/dev/null || true
     elif command -v yum &>/dev/null; then
         yum update -y -q
@@ -49,12 +78,12 @@ install_dependencies() {
         exit 1
     fi
 
-    # 安装网关所需的轻量 Python 库
-    pip3 install --quiet --upgrade aiohttp
+    # 兼容 Debian 13/Ubuntu 24+ PEP 668 外部环境限制
+    pip3 install --quiet --upgrade aiohttp --break-system-packages 2>/dev/null || true
     ok "系统核心依赖就绪"
 }
 
-# 4. 端口与网络探测
+# 5. 端口与网络探测
 setup_networking() {
     log "正在检测网络配置与公网 IP..."
     IPV4_REGEX="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
@@ -97,7 +126,7 @@ setup_networking() {
     fi
 }
 
-# 5. Docker 运行环境
+# 6. Docker 运行环境
 setup_docker() {
     if [ "$INSTALL_DOCKER" = "true" ]; then
         if ! command -v docker &>/dev/null; then
@@ -110,7 +139,7 @@ setup_docker() {
     fi
 }
 
-# 6. 服务部署逻辑
+# 7. 服务部署逻辑
 deploy_astrbot() {
     if [ "$INSTALL_ASTRBOT" != "true" ]; then return; fi
     log "正在配置并启动 AstrBot..."
@@ -159,7 +188,7 @@ deploy_gateway() {
     if [ "$INSTALL_GATEWAY" != "true" ]; then return; fi
     log "正在启动 M3 自适应动态网关服务..."
     mkdir -p "$DIR_GATEWAY"
-    cp "${BASE_DIR}/gateway_app.py" "${DIR_GATEWAY}/gateway_app.py"
+    cp "${BASE_DIR}/gateway_app.py" "${DIR_GATEWAY}/gateway_app.py" 2>/dev/null || true
 
     cat << SYSTEMD_GW > /etc/systemd/system/m3-gateway.service
 [Unit]
@@ -185,7 +214,7 @@ SYSTEMD_GW
     ok "M3 动态网关面板服务已启动"
 }
 
-# 7. Nginx 与 SSL 统一编排
+# 8. Nginx 与 SSL 统一编排
 setup_proxy_and_certs() {
     log "生成 Web 代理与安全网络层..."
     mkdir -p "$DIR_CERTS"
@@ -202,7 +231,6 @@ setup_proxy_and_certs() {
         export PATH="$HOME/.acme.sh:$PATH"
         ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
 
-        # 证书申请函数
         issue_cert() {
             local domain=$1
             local name=$2
@@ -218,7 +246,6 @@ setup_proxy_and_certs() {
         [ "$INSTALL_GATEWAY" = "true" ] && issue_cert "$GW_DOMAIN" "gw"
     fi
 
-    # 生成 Nginx 规则
     make_nginx_block() {
         local domain=$1
         local upstream_port=$2
@@ -282,7 +309,7 @@ BLOCK
     ok "网络代理转发层已就绪"
 }
 
-# 8. 流程执行
+# 9. 执行流水线
 install_dependencies
 setup_networking
 setup_docker
@@ -291,7 +318,7 @@ deploy_newapi
 deploy_gateway
 setup_proxy_and_certs
 
-# 9. 部署报告生成
+# 10. 输出总览报告
 clear
 PROTO="http"
 [ "$ENABLE_SSL" = "true" ] && PROTO="https"
