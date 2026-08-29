@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# M3 自研聚合网关 (带全量人设锁死 + 连通性测试) 极速部署控制器
+# M3 自研超级防御网关与 AstrBot 一键集群部署控制器
 # ==============================================================================
 
 set -eo pipefail
@@ -21,20 +21,19 @@ warn(){ echo -e "${LOG_WARN} $1"; }
 err() { echo -e "${LOG_ERROR} $1"; }
 
 if [ "$EUID" -ne 0 ]; then
-    err "必须使用 root 用户执行！"
+    err "必须使用 root 权限执行！"
     exit 1
 fi
 
-# 自动从 GitHub 同步最新代码
 mkdir -p "${BASE_DIR}"
 curl -fsSL "${RAW_BASE_URL}/config.env" -o "${BASE_DIR}/config.env" || true
 curl -fsSL "${RAW_BASE_URL}/gateway_app.py" -o "${BASE_DIR}/gateway_app.py" || true
 
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
 
-# 1. 基础环境
+# 1. 核心依赖安装与 Debian 13 PEP 668 兼容
 install_dependencies() {
-    log "准备基础环境与 Python 运行时..."
+    log "准备系统运行环境与 Python 异步协议栈..."
     if command -v apt-get &>/dev/null; then
         apt-get update -y -q
         apt-get install -y -q curl wget sudo ufw iptables socat cron sqlite3 psmisc nginx procps net-tools iproute2 python3 python3-pip python3-aiohttp
@@ -43,12 +42,12 @@ install_dependencies() {
         yum install -y -q curl wget sudo firewalld iptables socat crontabs sqlite psmisc nginx procps net-tools iproute python3 python3-pip
     fi
     pip3 install --quiet --upgrade aiohttp --break-system-packages 2>/dev/null || true
-    ok "环境依赖准备就绪"
+    ok "系统核心底层就绪"
 }
 
-# 2. 网络探测
+# 2. 网络探测与防火墙
 setup_networking() {
-    log "正在检测网络配置与公网 IP..."
+    log "检测公网 IPv4 地址..."
     IPV4_REGEX="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
     VPS_IP=""
     for api in "https://api.ipify.org" "https://icanhazip.com" "https://ifconfig.me/ip"; do
@@ -98,18 +97,18 @@ deploy_astrbot() {
       -p 127.0.0.1:${PORT_ASTRBOT_INTERNAL}:6185 \
       -v "${DIR_ASTRBOT}/data":/AstrBot/data \
       "$IMAGE_ASTRBOT"
-    ok "AstrBot 容器就绪"
+    ok "AstrBot 服务就绪"
 }
 
-# 4. 部署 M3 动态网关
+# 4. 部署 M3 超级防御网关
 deploy_gateway() {
-    log "注册 M3 聚合网关服务..."
+    log "配置 M3 超级防御网关守护进程..."
     mkdir -p "$DIR_GATEWAY"
     cp "${BASE_DIR}/gateway_app.py" "${DIR_GATEWAY}/gateway_app.py"
 
     cat << SYSTEMD_GW > /etc/systemd/system/m3-gateway.service
 [Unit]
-Description=M3 Dynamic Aggregation Gateway
+Description=M3 Super Shield Gateway
 After=network.target
 
 [Service]
@@ -129,12 +128,12 @@ SYSTEMD_GW
     systemctl daemon-reload
     systemctl enable --now m3-gateway
     systemctl restart m3-gateway
-    ok "M3 聚合网关就绪"
+    ok "M3 超级防御网关已就绪 (端口: ${PORT_GATEWAY_WEB})"
 }
 
-# 5. SSL 与 Nginx 配置
+# 5. SSL 与 Nginx 反代
 setup_nginx() {
-    log "配置 Nginx 代理..."
+    log "配置反向代理与证书..."
     mkdir -p "$DIR_CERTS" /etc/nginx/conf.d
     rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
 
@@ -219,7 +218,7 @@ BLOCK
     nginx -t
     systemctl enable --now nginx
     systemctl restart nginx
-    ok "Nginx 转发与 SSL 就绪"
+    ok "Nginx 与 SSL 代理已就绪"
 }
 
 install_dependencies
@@ -233,16 +232,16 @@ PROTO="http"
 [ "$ENABLE_SSL" = "true" ] && PROTO="https"
 
 echo "================================================================"
-echo "          M3 自研聚合网关与 AstrBot 集群已就绪                 "
+echo "          M3 超级防御网关与 AstrBot 集群已就绪                 "
 echo "================================================================"
-echo ">> [1] M3 全功能聚合网关控制台"
+echo ">> [1] M3 超级防御网关控制台"
 echo "   - 面板地址  : ${PROTO}://${GW_DOMAIN}"
 echo "   - 直连面板  : http://${VPS_IP}:${PORT_GATEWAY_WEB}"
 echo "   - 管理密钥  : sk-admin-root"
-echo "   - 提供给 AstrBot 的 Base URL : ${PROTO}://${GW_DOMAIN}/v1"
-echo "   - 提供给 AstrBot 的 API Key  : sk-astrbot-client-key"
+echo "   - 对接 AstrBot 的 Base URL : ${PROTO}://${GW_DOMAIN}/v1"
+echo "   - 对接 AstrBot 的 API Key  : sk-astrbot-client-key"
 echo "----------------------------------------------------------------"
-echo ">> [2] AstrBot 核心控制台"
+echo ">> [2] AstrBot 控制台"
 echo "   - 接入地址  : ${PROTO}://${BOT_DOMAIN}"
 echo "   - 初始账密  : 执行 [docker logs astrbot] 查看"
 echo "================================================================"
