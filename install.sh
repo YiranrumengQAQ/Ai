@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# M3 自研聚合网关 + AstrBot 生产级极速部署控制器
+# M3 自研聚合网关 (带全量人设锁死 + 连通性测试) 极速部署控制器
 # ==============================================================================
 
 set -eo pipefail
@@ -25,27 +25,16 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# 自动同步远端文件
-if [ ! -f "$CONFIG_FILE" ]; then
-    curl -fsSL "${RAW_BASE_URL}/config.env" -o "${BASE_DIR}/config.env" || true
-fi
-if [ ! -f "${BASE_DIR}/gateway_app.py" ]; then
-    curl -fsSL "${RAW_BASE_URL}/gateway_app.py" -o "${BASE_DIR}/gateway_app.py" || true
-fi
+# 自动从 GitHub 同步最新代码
+mkdir -p "${BASE_DIR}"
+curl -fsSL "${RAW_BASE_URL}/config.env" -o "${BASE_DIR}/config.env" || true
+curl -fsSL "${RAW_BASE_URL}/gateway_app.py" -o "${BASE_DIR}/gateway_app.py" || true
 
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
 
-# 1. 彻底停止并销毁旧版 New-API 遗留容器与环境
-cleanup_legacy() {
-    log "清理废弃组件与旧版 New-API 容器..."
-    docker stop new-api 2>/dev/null || true
-    docker rm new-api 2>/dev/null || true
-    rm -rf /etc/nginx/conf.d/newapi.conf /etc/nginx/conf.d/new_api.conf 2>/dev/null || true
-}
-
-# 2. 系统核心依赖安装
+# 1. 基础环境
 install_dependencies() {
-    log "正在准备基础环境与 Python 运行时..."
+    log "准备基础环境与 Python 运行时..."
     if command -v apt-get &>/dev/null; then
         apt-get update -y -q
         apt-get install -y -q curl wget sudo ufw iptables socat cron sqlite3 psmisc nginx procps net-tools iproute2 python3 python3-pip python3-aiohttp
@@ -54,12 +43,12 @@ install_dependencies() {
         yum install -y -q curl wget sudo firewalld iptables socat crontabs sqlite psmisc nginx procps net-tools iproute python3 python3-pip
     fi
     pip3 install --quiet --upgrade aiohttp --break-system-packages 2>/dev/null || true
-    ok "核心依赖安装完成"
+    ok "环境依赖准备就绪"
 }
 
-# 3. 网络与域名
+# 2. 网络探测
 setup_networking() {
-    log "检测公网 IPv4..."
+    log "正在检测网络配置与公网 IP..."
     IPV4_REGEX="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
     VPS_IP=""
     for api in "https://api.ipify.org" "https://icanhazip.com" "https://ifconfig.me/ip"; do
@@ -92,13 +81,13 @@ setup_networking() {
     fi
 }
 
-# 4. 部署 AstrBot
+# 3. 部署 AstrBot
 deploy_astrbot() {
     if [ "$INSTALL_DOCKER" = "true" ] && ! command -v docker &>/dev/null; then
         curl -fsSL https://get.docker.com | bash
         systemctl enable --now docker
     fi
-    log "部署 AstrBot 容器..."
+    log "启动 AstrBot 容器..."
     mkdir -p "${DIR_ASTRBOT}/data"
     docker stop astrbot 2>/dev/null || true
     docker rm astrbot 2>/dev/null || true
@@ -109,14 +98,14 @@ deploy_astrbot() {
       -p 127.0.0.1:${PORT_ASTRBOT_INTERNAL}:6185 \
       -v "${DIR_ASTRBOT}/data":/AstrBot/data \
       "$IMAGE_ASTRBOT"
-    ok "AstrBot 部署完成"
+    ok "AstrBot 容器就绪"
 }
 
-# 5. 部署并启动 M3 自研聚合网关
+# 4. 部署 M3 动态网关
 deploy_gateway() {
-    log "配置并启动 M3 聚合网关 Systemd 守护服务..."
+    log "注册 M3 聚合网关服务..."
     mkdir -p "$DIR_GATEWAY"
-    cp "${BASE_DIR}/gateway_app.py" "${DIR_GATEWAY}/gateway_app.py" 2>/dev/null || true
+    cp "${BASE_DIR}/gateway_app.py" "${DIR_GATEWAY}/gateway_app.py"
 
     cat << SYSTEMD_GW > /etc/systemd/system/m3-gateway.service
 [Unit]
@@ -140,12 +129,12 @@ SYSTEMD_GW
     systemctl daemon-reload
     systemctl enable --now m3-gateway
     systemctl restart m3-gateway
-    ok "M3 聚合网关服务运行中 (监听端口: ${PORT_GATEWAY_WEB})"
+    ok "M3 聚合网关就绪"
 }
 
-# 6. 配置 SSL 与 Nginx
+# 5. SSL 与 Nginx 配置
 setup_nginx() {
-    log "配置 Nginx 虚拟主机与 SSL..."
+    log "配置 Nginx 代理..."
     mkdir -p "$DIR_CERTS" /etc/nginx/conf.d
     rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
 
@@ -233,7 +222,6 @@ BLOCK
     ok "Nginx 转发与 SSL 就绪"
 }
 
-cleanup_legacy
 install_dependencies
 setup_networking
 deploy_astrbot
@@ -247,7 +235,7 @@ PROTO="http"
 echo "================================================================"
 echo "          M3 自研聚合网关与 AstrBot 集群已就绪                 "
 echo "================================================================"
-echo ">> [1] M3 全功能聚合网关控制台 (已替代 New-API)"
+echo ">> [1] M3 全功能聚合网关控制台"
 echo "   - 面板地址  : ${PROTO}://${GW_DOMAIN}"
 echo "   - 直连面板  : http://${VPS_IP}:${PORT_GATEWAY_WEB}"
 echo "   - 管理密钥  : sk-admin-root"
